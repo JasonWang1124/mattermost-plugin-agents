@@ -13,6 +13,7 @@ import (
 
 	"github.com/mattermost/mattermost-plugin-ai/llm"
 	"github.com/mattermost/mattermost/server/public/model"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 // ReadChannelArgs represents arguments for the read_channel tool
@@ -70,10 +71,10 @@ type GetUserChannelsArgs struct {
 func (p *MattermostToolProvider) getChannelTools() []MCPTool {
 	return []MCPTool{
 		{
-			Name:        "read_channel",
-			Description: "Read recent posts from a Mattermost channel. Parameters: channel_id (required), limit (1-100, default 20), since (ISO 8601 timestamp, optional). Returns post details including author, content, and timestamps. Example: {\"channel_id\": \"h5wqm8kxptbztfgzpaxbsqozah\", \"limit\": 10, \"since\": \"2024-01-01T00:00:00Z\"}",
-			Schema:      llm.NewJSONSchemaFromStruct[ReadChannelArgs](),
-			Resolver:    p.toolReadChannel,
+			Name:         "read_channel",
+			Description:  "Read recent posts from a Mattermost channel. Returns post details including author, content, file attachments (including inline images), and timestamps. Parameters: channel_id (required), limit (1-100, default 20), since (ISO 8601 timestamp, optional). Example: {\"channel_id\": \"h5wqm8kxptbztfgzpaxbsqozah\", \"limit\": 10, \"since\": \"2024-01-01T00:00:00Z\"}",
+			Schema:       llm.NewJSONSchemaFromStruct[ReadChannelArgs](),
+			RichResolver: p.toolReadChannelRich,
 		},
 		{
 			Name:        "create_channel",
@@ -252,6 +253,193 @@ func (p *MattermostToolProvider) toolReadChannel(mcpContext *MCPToolContext, arg
 	}
 
 	return result.String(), nil
+}
+
+// toolReadChannelRich implements the read_channel tool with rich content support (images).
+// It uses GetUsersByIds for batch user resolution (consistent with toolReadChannel).
+func (p *MattermostToolProvider) toolReadChannelRich(mcpContext *MCPToolContext, argsGetter llm.ToolArgumentGetter) ([]mcp.Content, error) {
+	var args ReadChannelArgs
+	err := argsGetter(&args)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get arguments for tool read_channel: %w", err)
+	}
+
+	if !model.IsValidId(args.ChannelID) {
+		return []mcp.Content{&mcp.TextContent{Text: "invalid channel_id format"}}, fmt.Errorf("channel_id must be a valid ID")
+	}
+
+	if args.Limit == 0 {
+		args.Limit = 20
+	}
+	if args.Limit > 100 {
+		args.Limit = 100
+	}
+
+	if mcpContext.Client == nil {
+		return nil, fmt.Errorf("client not available in context")
+	}
+	client := mcpContext.Client
+	ctx := mcpContext.Ctx
+
+	// Parse since timestamp if provided
+	var since int64
+	if args.Since != "" {
+		parsedTime, parseErr := time.Parse(time.RFC3339, args.Since)
+		if parseErr != nil {
+			return []mcp.Content{&mcp.TextContent{Text: "invalid since timestamp format"}}, fmt.Errorf("invalid timestamp format: %w", parseErr)
+		}
+		since = parsedTime.Unix() * 1000
+	}
+
+	// Get channel info
+	channel, _, err := client.GetChannel(ctx, args.ChannelID, "")
+	if err != nil {
+		return nil, fmt.Errorf("error fetching channel: %w", err)
+	}
+
+	// Determine display names (consistent with toolReadChannel)
+	channelDisplayName := channel.DisplayName
+	if channelDisplayName == "" {
+		switch channel.Type {
+		case model.ChannelTypeDirect:
+			channelDisplayName = "Direct Message"
+		case model.ChannelTypeGroup:
+			channelDisplayName = "Group Message"
+		default:
+			channelDisplayName = channel.Name
+		}
+	}
+
+	teamDisplayName := ""
+	if channel.TeamId == "" {
+		switch channel.Type {
+		case model.ChannelTypeDirect:
+			teamDisplayName = "Direct Message"
+		case model.ChannelTypeGroup:
+			teamDisplayName = "Group Message"
+		default:
+			teamDisplayName = "No Team"
+		}
+	} else {
+		team, _, teamErr := client.GetTeam(ctx, channel.TeamId, "")
+		if teamErr != nil {
+			return nil, fmt.Errorf("error fetching team: %w", teamErr)
+		}
+		teamDisplayName = team.DisplayName
+	}
+
+	posts, _, err := client.GetPostsForChannel(ctx, args.ChannelID, 0, args.Limit, "", false, false)
+	if err != nil {
+		return nil, fmt.Errorf("error fetching posts: %w", err)
+	}
+
+	var filteredPosts []*model.Post
+	for _, post := range posts.ToSlice() {
+		if since == 0 || post.CreateAt >= since {
+			filteredPosts = append(filteredPosts, post)
+		}
+	}
+
+	if len(filteredPosts) == 0 {
+		return []mcp.Content{&mcp.TextContent{Text: "no posts found in the specified timeframe"}}, nil
+	}
+
+	// Batch fetch users (consistent with toolReadChannel)
+	userIDs := make([]string, 0)
+	seen := make(map[string]bool)
+	for _, post := range filteredPosts {
+		if !seen[post.UserId] {
+			seen[post.UserId] = true
+			userIDs = append(userIDs, post.UserId)
+		}
+	}
+
+	userCache := make(map[string]string)
+	users, _, err := client.GetUsersByIds(ctx, userIDs)
+	if err != nil {
+		p.logger.Warn("failed to fetch users by IDs", "error", err)
+		for _, id := range userIDs {
+			userCache[id] = "Unknown User"
+		}
+	} else {
+		for _, user := range users {
+			userCache[user.Id] = user.Username
+		}
+		for _, id := range userIDs {
+			if _, exists := userCache[id]; !exists {
+				userCache[id] = "Unknown User"
+			}
+		}
+	}
+
+	// Collect all content (text + images)
+	contents := []mcp.Content{}
+	var textBuf strings.Builder
+
+	flushText := func() {
+		if textBuf.Len() > 0 {
+			contents = append(contents, &mcp.TextContent{Text: textBuf.String()})
+			textBuf.Reset()
+		}
+	}
+
+	// Write header
+	textBuf.WriteString(fmt.Sprintf("Channel: %s (Team: %s)\n", channelDisplayName, teamDisplayName))
+	textBuf.WriteString(fmt.Sprintf("Found %d posts:\n\n", len(filteredPosts)))
+
+	for i, post := range filteredPosts {
+		username := userCache[post.UserId]
+		textBuf.WriteString(fmt.Sprintf("**Post %d** by %s:\n", i+1, username))
+		textBuf.WriteString(fmt.Sprintf("Post ID: %s\n", post.Id))
+		textBuf.WriteString(fmt.Sprintf("%s\n", post.Message))
+
+		// Check for file attachments
+		if len(post.FileIds) > 0 {
+			fileInfos, _, fileErr := client.GetFileInfosForPost(ctx, post.Id, "")
+			if fileErr != nil {
+				p.logger.Warn("failed to get file infos for post", "post_id", post.Id, "error", fileErr)
+			} else {
+				nonImageFiles := []string{}
+				for _, fileInfo := range fileInfos {
+					if isImageMimeType(fileInfo.MimeType) {
+						textBuf.WriteString(fmt.Sprintf("[Image: %s (%dx%d)]\n", fileInfo.Name, fileInfo.Width, fileInfo.Height))
+
+						// Flush text before adding image content
+						flushText()
+
+						fileData, _, getFileErr := client.GetFile(ctx, fileInfo.Id)
+						if getFileErr != nil {
+							p.logger.Warn("failed to get file data", "file_id", fileInfo.Id, "error", getFileErr)
+							textBuf.WriteString(fmt.Sprintf("[Failed to load image: %s]\n", fileInfo.Name))
+						} else {
+							contents = append(contents, &mcp.ImageContent{
+								Data:     fileData,
+								MIMEType: fileInfo.MimeType,
+							})
+						}
+					} else {
+						nonImageFiles = append(nonImageFiles, fmt.Sprintf("  - %s (%s, %d bytes)", fileInfo.Name, fileInfo.MimeType, fileInfo.Size))
+					}
+				}
+				if len(nonImageFiles) > 0 {
+					textBuf.WriteString("Attachments:\n")
+					textBuf.WriteString(strings.Join(nonImageFiles, "\n"))
+					textBuf.WriteString("\n")
+				}
+			}
+		}
+
+		textBuf.WriteString("\n")
+	}
+
+	// Flush any remaining text
+	flushText()
+
+	if len(contents) == 0 {
+		contents = append(contents, &mcp.TextContent{Text: "no posts found"})
+	}
+
+	return contents, nil
 }
 
 // toolCreateChannel implements the create_channel tool.
@@ -445,11 +633,22 @@ func (p *MattermostToolProvider) toolGetChannelInfo(mcpContext *MCPToolContext, 
 	result.WriteString(fmt.Sprintf("Type: %s\n", channel.Type))
 	result.WriteString(fmt.Sprintf("Team ID: %s\n", channel.TeamId))
 
-	// Get team info
-	team, _, teamErr := client.GetTeam(ctx, channel.TeamId, "")
-	if teamErr == nil {
-		result.WriteString(fmt.Sprintf("Team Name: %s\n", team.Name))
-		result.WriteString(fmt.Sprintf("Team Display Name: %s\n", team.DisplayName))
+	// Get team info (only for non-DM channels)
+	if channel.TeamId != "" {
+		team, _, teamErr := client.GetTeam(ctx, channel.TeamId, "")
+		if teamErr == nil {
+			result.WriteString(fmt.Sprintf("Team Name: %s\n", team.Name))
+			result.WriteString(fmt.Sprintf("Team Display Name: %s\n", team.DisplayName))
+		}
+	} else {
+		// For DM/Group channels, show appropriate message
+		if channel.Type == model.ChannelTypeDirect {
+			result.WriteString("Team Display Name: Direct Message\n")
+		} else if channel.Type == model.ChannelTypeGroup {
+			result.WriteString("Team Display Name: Group Message\n")
+		} else {
+			result.WriteString("Team Display Name: N/A\n")
+		}
 	}
 
 	if channel.Purpose != "" {
@@ -482,17 +681,28 @@ func (p *MattermostToolProvider) formatMultipleChannels(ctx context.Context, cli
 	for i, channel := range channels {
 		result.WriteString(fmt.Sprintf("%d. Channel: %s\n", i+1, channel.DisplayName))
 
-		// Get team info from cache or fetch
-		team, exists := teamCache[channel.TeamId]
-		if !exists {
-			fetchedTeam, _, err := client.GetTeam(ctx, channel.TeamId, "")
-			if err == nil {
-				team = fetchedTeam
-				teamCache[channel.TeamId] = team
+		// Get team info from cache or fetch (only for non-DM channels)
+		if channel.TeamId != "" {
+			team, exists := teamCache[channel.TeamId]
+			if !exists {
+				fetchedTeam, _, err := client.GetTeam(ctx, channel.TeamId, "")
+				if err == nil {
+					team = fetchedTeam
+					teamCache[channel.TeamId] = team
+					result.WriteString(fmt.Sprintf("   Team: %s (Team ID: %s)\n", team.DisplayName, team.Id))
+				}
+			} else {
 				result.WriteString(fmt.Sprintf("   Team: %s (Team ID: %s)\n", team.DisplayName, team.Id))
 			}
 		} else {
-			result.WriteString(fmt.Sprintf("   Team: %s (Team ID: %s)\n", team.DisplayName, team.Id))
+			// For DM/Group channels, show appropriate message
+			if channel.Type == model.ChannelTypeDirect {
+				result.WriteString("   Team: Direct Message\n")
+			} else if channel.Type == model.ChannelTypeGroup {
+				result.WriteString("   Team: Group Message\n")
+			} else {
+				result.WriteString("   Team: N/A\n")
+			}
 		}
 
 		result.WriteString(fmt.Sprintf("   Channel ID: %s\n", channel.Id))

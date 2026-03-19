@@ -30,12 +30,16 @@ type MCPToolContext struct {
 // MCPToolResolver defines the signature for MCP tool resolvers
 type MCPToolResolver func(*MCPToolContext, llm.ToolArgumentGetter) (string, error)
 
+// MCPRichToolResolver defines the signature for MCP tool resolvers that return rich content (text + images)
+type MCPRichToolResolver func(*MCPToolContext, llm.ToolArgumentGetter) ([]mcp.Content, error)
+
 // MCPTool represents a tool specifically for MCP use with our custom context
 type MCPTool struct {
-	Name        string
-	Description string
-	Schema      *jsonschema.Schema
-	Resolver    MCPToolResolver
+	Name         string
+	Description  string
+	Schema       *jsonschema.Schema
+	Resolver     MCPToolResolver
+	RichResolver MCPRichToolResolver // Optional: takes priority over Resolver when set, supports returning images
 }
 
 type ToolProvider interface {
@@ -148,6 +152,25 @@ func (p *MattermostToolProvider) registerDynamicTool(server *mcp.Server, mcpTool
 			}
 
 			return json.Unmarshal(argumentsBytes, target)
+		}
+
+		// Use RichResolver if available, otherwise fall back to Resolver
+		if mcpTool.RichResolver != nil {
+			contents, err := mcpTool.RichResolver(mcpContext, argsGetter)
+			if err != nil {
+				p.logger.Debug("Tool rich resolver failed", "tool", mcpTool.Name, "error", err)
+				return &mcp.CallToolResult{
+					Content: []mcp.Content{
+						&mcp.TextContent{Text: "Error: " + err.Error()},
+					},
+					IsError: true,
+				}, nil
+			}
+
+			return &mcp.CallToolResult{
+				Content: contents,
+				IsError: false,
+			}, nil
 		}
 
 		// Call the tool resolver

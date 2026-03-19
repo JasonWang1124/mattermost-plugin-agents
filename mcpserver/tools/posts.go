@@ -9,6 +9,7 @@ import (
 
 	"github.com/mattermost/mattermost-plugin-ai/llm"
 	"github.com/mattermost/mattermost/server/public/model"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 // ReadPostArgs represents arguments for the read_post tool
@@ -68,10 +69,10 @@ func (p *MattermostToolProvider) getPostTools() []MCPTool {
 
 	return []MCPTool{
 		{
-			Name:        "read_post",
-			Description: "Read a specific post and its thread from Mattermost. Parameters: post_id (required), include_thread (boolean, default true). Returns post content, author info, and optionally all replies in the thread. Example: {\"post_id\": \"8xqzn3pfmtbyfkr9hqbw4hheoa\", \"include_thread\": true}",
-			Schema:      NewJSONSchemaForAccessMode[ReadPostArgs](string(p.accessMode)),
-			Resolver:    p.toolReadPost,
+			Name:         "read_post",
+			Description:  "Read a specific post and its thread from Mattermost. Returns post content, author info, file attachments (including inline images), and optionally all replies in the thread. Parameters: post_id (required), include_thread (boolean, default true). Example: {\"post_id\": \"8xqzn3pfmtbyfkr9hqbw4hheoa\", \"include_thread\": true}",
+			Schema:       NewJSONSchemaForAccessMode[ReadPostArgs](string(p.accessMode)),
+			RichResolver: p.toolReadPostRich,
 		},
 		{
 			Name:        "create_post",
@@ -228,6 +229,180 @@ func (p *MattermostToolProvider) toolReadPost(mcpContext *MCPToolContext, argsGe
 	return result.String(), nil
 }
 
+// toolReadPostRich implements the read_post tool with rich content support (images)
+func (p *MattermostToolProvider) toolReadPostRich(mcpContext *MCPToolContext, argsGetter llm.ToolArgumentGetter) ([]mcp.Content, error) {
+	var args ReadPostArgs
+	err := argsGetter(&args)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get arguments for tool read_post: %w", err)
+	}
+
+	// Validate post ID
+	if !model.IsValidId(args.PostID) {
+		return []mcp.Content{&mcp.TextContent{Text: "invalid post_id format"}}, fmt.Errorf("post_id must be a valid ID")
+	}
+
+	// Set default for include_thread
+	if !args.IncludeThread {
+		args.IncludeThread = true
+	}
+
+	if mcpContext.Client == nil {
+		return nil, fmt.Errorf("client not available in context")
+	}
+	client := mcpContext.Client
+	ctx := mcpContext.Ctx
+
+	var posts []*model.Post
+
+	if args.IncludeThread {
+		postList, _, err := client.GetPostThread(ctx, args.PostID, "", false)
+		if err != nil {
+			return nil, fmt.Errorf("error fetching post thread: %w", err)
+		}
+
+		posts = make([]*model.Post, 0, len(postList.Posts))
+		for _, post := range postList.Posts {
+			posts = append(posts, post)
+		}
+
+		// Sort posts by CreateAt
+		for i := 0; i < len(posts)-1; i++ {
+			for j := i + 1; j < len(posts); j++ {
+				if posts[i].CreateAt > posts[j].CreateAt {
+					posts[i], posts[j] = posts[j], posts[i]
+				}
+			}
+		}
+	} else {
+		post, _, err := client.GetPost(ctx, args.PostID, "")
+		if err != nil {
+			return nil, fmt.Errorf("error fetching post: %w", err)
+		}
+		posts = []*model.Post{post}
+	}
+
+	if len(posts) == 0 {
+		return []mcp.Content{&mcp.TextContent{Text: "no posts found"}}, nil
+	}
+
+	// Get channel and team info for context
+	var channelName, teamName string
+	if len(posts) > 0 {
+		channel, _, err := client.GetChannel(ctx, posts[0].ChannelId, "")
+		if err == nil {
+			channelName = channel.DisplayName
+			if channel.TeamId != "" {
+				team, _, teamErr := client.GetTeam(ctx, channel.TeamId, "")
+				if teamErr == nil {
+					teamName = team.DisplayName
+				}
+			}
+		}
+	}
+
+	// Build text content
+	var result strings.Builder
+	if channelName != "" && teamName != "" {
+		result.WriteString(fmt.Sprintf("Channel: %s (Team: %s)\n", channelName, teamName))
+	}
+
+	if len(posts) > 0 {
+		result.WriteString(fmt.Sprintf("Channel ID: %s\n", posts[0].ChannelId))
+
+		var rootID string
+		for _, post := range posts {
+			if post.RootId != "" {
+				rootID = post.RootId
+				break
+			}
+		}
+		if rootID != "" {
+			result.WriteString(fmt.Sprintf("Root ID: %s\n", rootID))
+		}
+	}
+	result.WriteString("\n")
+
+	if args.IncludeThread && len(posts) > 1 {
+		result.WriteString(fmt.Sprintf("Thread with %d posts:\n\n", len(posts)))
+	}
+
+	// Collect all content (text + images)
+	// Use a single text buffer; flush it before each image content
+	contents := []mcp.Content{}
+	var textBuf strings.Builder
+	textBuf.WriteString(result.String())
+
+	flushText := func() {
+		if textBuf.Len() > 0 {
+			contents = append(contents, &mcp.TextContent{Text: textBuf.String()})
+			textBuf.Reset()
+		}
+	}
+
+	for i, post := range posts {
+		// Get user info for the post
+		user, _, err := client.GetUser(ctx, post.UserId, "")
+		if err != nil {
+			p.logger.Warn("failed to get user for post", "user_id", post.UserId, "error", err)
+			textBuf.WriteString(fmt.Sprintf("**Post %d** by Unknown User:\n", i+1))
+		} else {
+			textBuf.WriteString(fmt.Sprintf("**Post %d** by %s:\n", i+1, user.Username))
+		}
+
+		textBuf.WriteString(fmt.Sprintf("Post ID: %s\n", post.Id))
+		textBuf.WriteString(fmt.Sprintf("%s\n", post.Message))
+
+		// Check for file attachments
+		if len(post.FileIds) > 0 {
+			fileInfos, _, fileErr := client.GetFileInfosForPost(ctx, post.Id, "")
+			if fileErr != nil {
+				p.logger.Warn("failed to get file infos for post", "post_id", post.Id, "error", fileErr)
+			} else {
+				nonImageFiles := []string{}
+				for _, fileInfo := range fileInfos {
+					if isImageMimeType(fileInfo.MimeType) {
+						textBuf.WriteString(fmt.Sprintf("[Image: %s (%dx%d)]\n", fileInfo.Name, fileInfo.Width, fileInfo.Height))
+
+						// Flush text before adding image content
+						flushText()
+
+						// Fetch and embed the image
+						fileData, _, getFileErr := client.GetFile(ctx, fileInfo.Id)
+						if getFileErr != nil {
+							p.logger.Warn("failed to get file data", "file_id", fileInfo.Id, "error", getFileErr)
+							textBuf.WriteString(fmt.Sprintf("[Failed to load image: %s]\n", fileInfo.Name))
+						} else {
+							contents = append(contents, &mcp.ImageContent{
+								Data:     fileData,
+								MIMEType: fileInfo.MimeType,
+							})
+						}
+					} else {
+						nonImageFiles = append(nonImageFiles, fmt.Sprintf("  - %s (%s, %d bytes)", fileInfo.Name, fileInfo.MimeType, fileInfo.Size))
+					}
+				}
+				if len(nonImageFiles) > 0 {
+					textBuf.WriteString("Attachments:\n")
+					textBuf.WriteString(strings.Join(nonImageFiles, "\n"))
+					textBuf.WriteString("\n")
+				}
+			}
+		}
+
+		textBuf.WriteString("\n")
+	}
+
+	// Flush any remaining text
+	flushText()
+
+	if len(contents) == 0 {
+		contents = append(contents, &mcp.TextContent{Text: "no posts found"})
+	}
+
+	return contents, nil
+}
+
 // toolCreatePost implements the create_post tool
 func (p *MattermostToolProvider) toolCreatePost(mcpContext *MCPToolContext, argsGetter llm.ToolArgumentGetter) (string, error) {
 	var args CreatePostArgs
@@ -246,6 +421,7 @@ func (p *MattermostToolProvider) toolCreatePost(mcpContext *MCPToolContext, args
 	if args.ChannelDisplayName == "" {
 		return "channel_display_name is required", fmt.Errorf("channel_display_name cannot be empty - you must call get_channel_info first")
 	}
+	// TeamDisplayName can be "Direct Message" or "Group Message" for DM channels
 	if args.TeamDisplayName == "" {
 		return "team_display_name is required", fmt.Errorf("team_display_name cannot be empty - you must call get_channel_info first")
 	}
@@ -274,17 +450,36 @@ func (p *MattermostToolProvider) toolCreatePost(mcpContext *MCPToolContext, args
 			fmt.Errorf("channel display name validation failed")
 	}
 
-	// Get team info to validate team display name
-	team, _, err := client.GetTeam(ctx, channel.TeamId, "")
-	if err != nil {
-		return "failed to validate team", fmt.Errorf("error fetching team for validation: %w", err)
-	}
+	// For DM/Group channels, TeamId is empty - validate against special display names
+	// For regular channels, validate against actual team
+	var teamDisplayName string
+	if channel.TeamId == "" {
+		// DM and Group channels don't have a team
+		validDMTeamNames := map[string]bool{
+			"Direct Message": true,
+			"Group Message":  true,
+			"N/A":            true,
+		}
+		if !validDMTeamNames[args.TeamDisplayName] {
+			return fmt.Sprintf("team_display_name mismatch for DM/Group channel: provided '%s' but expected 'Direct Message', 'Group Message', or 'N/A'",
+					args.TeamDisplayName),
+				fmt.Errorf("team display name validation failed for DM channel")
+		}
+		teamDisplayName = args.TeamDisplayName
+	} else {
+		// Regular channel - validate against actual team
+		team, _, err := client.GetTeam(ctx, channel.TeamId, "")
+		if err != nil {
+			return "failed to validate team", fmt.Errorf("error fetching team for validation: %w", err)
+		}
 
-	// Check if team display name matches
-	if team.DisplayName != args.TeamDisplayName {
-		return fmt.Sprintf("team_display_name mismatch: provided '%s' but team ID '%s' has display name '%s'",
-				args.TeamDisplayName, channel.TeamId, team.DisplayName),
-			fmt.Errorf("team display name validation failed")
+		// Check if team display name matches
+		if team.DisplayName != args.TeamDisplayName {
+			return fmt.Sprintf("team_display_name mismatch: provided '%s' but team ID '%s' has display name '%s'",
+					args.TeamDisplayName, channel.TeamId, team.DisplayName),
+				fmt.Errorf("team display name validation failed")
+		}
+		teamDisplayName = team.DisplayName
 	}
 
 	// Upload files if specified
@@ -327,7 +522,7 @@ func (p *MattermostToolProvider) toolCreatePost(mcpContext *MCPToolContext, args
 	}
 
 	return fmt.Sprintf("Successfully created post in channel '%s' (Team: %s) with ID: %s%s",
-		channel.DisplayName, team.DisplayName, createdPost.Id, attachmentMessage), nil
+		channel.DisplayName, teamDisplayName, createdPost.Id, attachmentMessage), nil
 }
 
 // toolCreatePostAsUser implements the create_post_as_user tool with custom authentication
@@ -490,7 +685,7 @@ func (p *MattermostToolProvider) toolDMToAnother(mcpContext *MCPToolContext, arg
 		return "client not available", fmt.Errorf("client not available in context")
 	}
 	client := mcpContext.Client
-	ctx := context.Background()
+	ctx := mcpContext.Ctx
 
 	// Get current user information
 	currentUser, _, err := client.GetMe(ctx, "")

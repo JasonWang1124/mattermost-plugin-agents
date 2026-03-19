@@ -163,6 +163,11 @@ func isValidImageFile(filename string) bool {
 	return false
 }
 
+// isImageMimeType checks if the MIME type represents an image
+func isImageMimeType(mimeType string) bool {
+	return strings.HasPrefix(mimeType, "image/")
+}
+
 // uploadFilesForLocal uploads multiple files from URLs or file paths (local access only) and returns their file IDs
 func uploadFilesForLocal(ctx context.Context, client *model.Client4, channelID string, filespecs []string, accessMode AccessMode) ([]string, error) {
 	var fileIDs []string
